@@ -1,91 +1,78 @@
-package body
+package querystring
 
 import (
-	"crypto/rand"
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
-	"fmt"
-	"io"
 	"net/http"
+	"strconv"
+	"time"
 
-	"github.com/google/martian/v3/log"
-	"github.com/google/martian/v3/parse"
+	"github.com/google/martian"
+	"github.com/google/martian/parse"
 )
 
 func init() {
-	parse.Register("body.ResponseErrorModifier", modifierFromJSON)
+	parse.Register("querystring.MarvelModifier", marvelModifierFromJSON)
 }
 
-// Modifier substitutes the body on an HTTP response.
-type ResponseErrorModifier struct {
-	contentType string
-	body        []byte
-	boundary    string
+// MarvelModifier contains the private and public Marvel API key
+type MarvelModifier struct {
+	public, private string
 }
 
-type ResponseErrorModifierJSON struct {
-	ContentType string               `json:"contentType"`
-	Body        []byte               `json:"body"` // Body is expected to be a Base64 encoded string.
-	Scope       []parse.ModifierType `json:"scope"`
+// MarvelModifierJSON to Unmarshal the JSON configuration
+type MarvelModifierJSON struct {
+	Public  string               `json:"public"`
+	Private string               `json:"private"`
+	Scope   []parse.ModifierType `json:"scope"`
 }
 
-// NewModifier constructs and returns a body.Modifier.
-func NewModifier(b []byte, contentType string) *ResponseErrorModifier {
-	log.Debugf("body.NewModifier: len(b): %d, contentType %s", len(b), contentType)
-	return &ResponseErrorModifier{
-		contentType: contentType,
-		body:        b,
-		boundary:    randomBoundary(),
+// ModifyRequest modifies the query string of the request with the given key and value.
+func (m *MarvelModifier) ModifyRequest(req *http.Request) error {
+	query := req.URL.Query()
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	hash := GetMD5Hash(ts + m.private + m.public)
+	query.Set("apikey", m.public)
+	query.Set("ts", ts)
+	query.Set("hash", hash)
+	req.URL.RawQuery = query.Encode()
+
+	return nil
+}
+
+// GetMD5Hash returns the md5 hash from a string
+func GetMD5Hash(text string) string {
+	hasher := md5.New()
+	hasher.Write([]byte(text))
+	return hex.EncodeToString(hasher.Sum(nil))
+}
+
+// MarvelNewModifier returns a request modifier that will set the query string
+// at key with the given value. If the query string key already exists all
+// values will be overwritten.
+func MarvelNewModifier(public, private string) martian.RequestModifier {
+	return &MarvelModifier{
+		public:  public,
+		private: private,
 	}
 }
 
-// modifierFromJSON takes a JSON message as a byte slice and returns a
-// body.Modifier and an error.
+// marvelModifierFromJSON takes a JSON message as a byte slice and returns
+// a querystring.modifier and an error.
 //
-// Example JSON Configuration message:
+// Example JSON:
 // {
-//   "scope": ["request", "response"],
-//   "contentType": "text/plain",
-//   "body": "c29tZSBkYXRhIHdpdGggACBhbmQg77u/" // Base64 encoded body
+//  "public": "apikey",
+//  "private": "apikey",
+//  "scope": ["request", "response"]
 // }
-func modifierFromJSON(b []byte) (*parse.Result, error) {
-	msg := &ResponseErrorModifierJSON{}
+func marvelModifierFromJSON(b []byte) (*parse.Result, error) {
+	msg := &MarvelModifierJSON{}
+
 	if err := json.Unmarshal(b, msg); err != nil {
 		return nil, err
 	}
 
-	mod := NewModifier(msg.Body, msg.ContentType)
-	return parse.NewResult(mod, msg.Scope)
-}
-
-// SetBoundary set the boundary string used for multipart range responses.
-func (m *ResponseErrorModifier) SetBoundary(boundary string) {
-	m.boundary = boundary
-}
-
-// ModifyResponse sets the Content-Type header and overrides the response body.
-func (m *ResponseErrorModifier) ModifyResponse(res *http.Response) error {
-	log.Debugf("body.ModifyResponse: request: %s", res.Request.URL)
-	// Replace the existing body, close it first.
-	defer res.Body.Close()
-
-	var recreatedResponse interface{}
-	err := json.NewDecoder(res.Body).Decode(&recreatedResponse)
-	if err != nil {
-		fmt.Println("Error in decoding the response")
-	} else {
-		fmt.Printf("%s", recreatedResponse)
-	}
-	return nil
-}
-
-// randomBoundary generates a 30 character string for boundaries for mulipart range
-// requests. This func panics if io.Readfull fails.
-// Borrowed from: https://golang.org/src/mime/multipart/writer.go?#L73
-func randomBoundary() string {
-	var buf [30]byte
-	_, err := io.ReadFull(rand.Reader, buf[:])
-	if err != nil {
-		panic(err)
-	}
-	return fmt.Sprintf("%x", buf[:])
+	return parse.NewResult(MarvelNewModifier(msg.Public, msg.Private), msg.Scope)
 }
