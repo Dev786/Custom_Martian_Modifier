@@ -1,78 +1,106 @@
-package querystring
+package body
 
 import (
-	"crypto/md5"
-	"encoding/hex"
+	"bytes"
+	"crypto/rand"
 	"encoding/json"
+	"fmt"
+	"io"
+	"io/ioutil"
 	"net/http"
-	"strconv"
-	"time"
 
-	"github.com/google/martian"
-	"github.com/google/martian/parse"
+	"github.com/google/martian/v3/log"
+	"github.com/google/martian/v3/parse"
 )
 
 func init() {
-	parse.Register("querystring.MarvelModifier", marvelModifierFromJSON)
+	parse.Register("body.ErrorModifier", modifierFromJSON)
 }
 
-// MarvelModifier contains the private and public Marvel API key
-type MarvelModifier struct {
-	public, private string
+// ErrorModifier substitutes the body on an HTTP response.
+type ErrorModifier struct {
+	contentType string
+	body        []byte
+	boundary    string
 }
 
-// MarvelModifierJSON to Unmarshal the JSON configuration
-type MarvelModifierJSON struct {
-	Public  string               `json:"public"`
-	Private string               `json:"private"`
-	Scope   []parse.ModifierType `json:"scope"`
+type modifierJSON struct {
+	ContentType string               `json:"contentType"`
+	Body        []byte               `json:"body"` // Body is expected to be a Base64 encoded string.
+	Scope       []parse.ModifierType `json:"scope"`
 }
 
-// ModifyRequest modifies the query string of the request with the given key and value.
-func (m *MarvelModifier) ModifyRequest(req *http.Request) error {
-	query := req.URL.Query()
-	ts := strconv.FormatInt(time.Now().Unix(), 10)
-	hash := GetMD5Hash(ts + m.private + m.public)
-	query.Set("apikey", m.public)
-	query.Set("ts", ts)
-	query.Set("hash", hash)
-	req.URL.RawQuery = query.Encode()
-
-	return nil
-}
-
-// GetMD5Hash returns the md5 hash from a string
-func GetMD5Hash(text string) string {
-	hasher := md5.New()
-	hasher.Write([]byte(text))
-	return hex.EncodeToString(hasher.Sum(nil))
-}
-
-// MarvelNewModifier returns a request modifier that will set the query string
-// at key with the given value. If the query string key already exists all
-// values will be overwritten.
-func MarvelNewModifier(public, private string) martian.RequestModifier {
-	return &MarvelModifier{
-		public:  public,
-		private: private,
+// NewModifier constructs and returns a body.ErrorModifier.
+func NewModifier(b []byte, contentType string) *ErrorModifier {
+	log.Debugf("body.NewModifier: len(b): %d, contentType %s", len(b), contentType)
+	return &ErrorModifier{
+		contentType: contentType,
+		body:        b,
+		boundary:    randomBoundary(),
 	}
 }
 
-// marvelModifierFromJSON takes a JSON message as a byte slice and returns
-// a querystring.modifier and an error.
+// modifierFromJSON takes a JSON message as a byte slice and returns a
+// body.ErrorModifier and an error.
 //
-// Example JSON:
+// Example JSON Configuration message:
 // {
-//  "public": "apikey",
-//  "private": "apikey",
-//  "scope": ["request", "response"]
+//   "scope": ["request", "response"],
+//   "contentType": "text/plain",
+//   "body": "c29tZSBkYXRhIHdpdGggACBhbmQg77u/" // Base64 encoded body
 // }
-func marvelModifierFromJSON(b []byte) (*parse.Result, error) {
-	msg := &MarvelModifierJSON{}
-
+func modifierFromJSON(b []byte) (*parse.Result, error) {
+	msg := &modifierJSON{}
 	if err := json.Unmarshal(b, msg); err != nil {
 		return nil, err
 	}
 
-	return parse.NewResult(MarvelNewModifier(msg.Public, msg.Private), msg.Scope)
+	mod := NewModifier(msg.Body, msg.ContentType)
+	return parse.NewResult(mod, msg.Scope)
+}
+
+// ModifyRequest sets the Content-Type header and overrides the request body.
+func (m *ErrorModifier) ModifyRequest(req *http.Request) error {
+	log.Debugf("body.ModifyRequest: request: %s", req.URL)
+	req.Body.Close()
+
+	req.Header.Set("Content-Type", m.contentType)
+
+	// Reset the Content-Encoding since we know that the new body isn't encoded.
+	req.Header.Del("Content-Encoding")
+
+	req.ContentLength = int64(len(m.body))
+	req.Body = ioutil.NopCloser(bytes.NewReader(m.body))
+
+	return nil
+}
+
+// SetBoundary set the boundary string used for multipart range responses.
+func (m *ErrorModifier) SetBoundary(boundary string) {
+	m.boundary = boundary
+}
+
+// ModifyResponse sets the Content-Type header and overrides the response body.
+func (m *ErrorModifier) ModifyResponse(res *http.Response) error {
+	log.Debugf("body.ModifyResponse: request: %s", res.Request.URL)
+	// Replace the existing body, close it first.
+	defer res.Body.Close()
+
+	var recreatedResponse interface{}
+	err := json.NewDecoder(res.Body).Decode(&recreatedResponse)
+	fmt.Println("recreating new Response")
+	fmt.Printf("%s", recreatedResponse)
+	return nil
+}
+
+// randomBoundary generates a 30 character string for boundaries for mulipart range
+// requests. This func panics if io.Readfull fails.
+// Borrowed from: https://golang.org/src/mime/multipart/writer.go?#L73
+func randomBoundary() string {
+	var buf [30]byte
+	_, err := io.ReadFull(rand.Reader, buf[:])
+	if err != nil {
+		panic(err)
+	}
+	return fmt.Sprintf("%x", buf[:])
 }
